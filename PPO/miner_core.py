@@ -620,7 +620,9 @@ class FactorMinerCore:
                 if eval_result['valid']:
                     final_reward = eval_result['reward']
                 else:
-                    final_reward = -1.0
+                    # 🔥 无效表达式给予小的负奖励，而非-1.0
+                    # 这样PPO能学习到"避免无效表达式"但不会被过大的惩罚干扰
+                    final_reward = -0.1
                     # 调试：记录失败原因
                     if iteration < 3:  # 只在前几次迭代打印
                         logger.debug(f"Expression invalid: {tokens}, reason: {eval_result.get('reason', 'unknown')}")
@@ -628,18 +630,20 @@ class FactorMinerCore:
                 raw_rewards.append(final_reward)
                 eval_results.append(eval_result)
 
-            # 归一化奖励
-            normalized_rewards = self._normalize_rewards(raw_rewards)
+            # 🔥 移除归一化！直接使用原始增量Sharpe作为奖励
+            # 原因：增量Sharpe是稀疏但真实的信号，归一化会破坏其意义
+            # 只做简单的clip防止极端值
+            clipped_rewards = [np.clip(r, -2.0, 5.0) for r in raw_rewards]
 
             # 添加到buffer
             for i in range(batch_size):
                 tokens, state_ids, trajectory = batch_results[i]
-                final_reward_normalized = normalized_rewards[i]
+                final_reward = clipped_rewards[i]  # 🔥 使用clipped而非normalized
                 expression_length = len(trajectory['states'])
 
                 # 步骤奖励分配
                 step_rewards = self._compute_step_rewards(
-                    final_reward_normalized, expression_length
+                    final_reward, expression_length
                 )
 
                 for j in range(len(trajectory['states'])):
@@ -740,31 +744,13 @@ class FactorMinerCore:
             'combination_model': self.combination_model
         }
 
-    def _normalize_rewards(self, rewards: List[float]) -> List[float]:
-        """归一化奖励"""
-        if not rewards:
-            return []
-
-        batch_mean = np.mean(rewards)
-        batch_std = np.std(rewards) + 1e-8
-
-        if len(self.reward_history) == 0:
-            self.reward_mean = batch_mean
-            self.reward_std = batch_std
-        else:
-            self.reward_mean = (self.reward_momentum * self.reward_mean +
-                              (1 - self.reward_momentum) * batch_mean)
-            self.reward_std = (self.reward_momentum * self.reward_std +
-                             (1 - self.reward_momentum) * batch_std)
-
-        self.reward_history.extend(rewards)
-        if len(self.reward_history) > 1000:
-            self.reward_history = self.reward_history[-1000:]
-
-        normalized = [(r - self.reward_mean) / (self.reward_std + 1e-8) for r in rewards]
-        normalized = [np.clip(r, -5.0, 5.0) for r in normalized]
-
-        return normalized
+    # 🔥 已废弃：奖励归一化会破坏增量Sharpe的真实信号
+    # 稀疏奖励（大部分接近0，少数>阈值）才能让PPO学习到"哪些因子真正有价值"
+    # 如果归一化，会让PPO误以为"批次内相对好"="真正好"
+    #
+    # def _normalize_rewards(self, rewards: List[float]) -> List[float]:
+    #     """归一化奖励 - DEPRECATED"""
+    #     pass
 
     def _compute_step_rewards(self, final_reward: float, length: int) -> List[float]:
         """计算步骤奖励"""

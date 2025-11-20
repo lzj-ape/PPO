@@ -90,7 +90,7 @@ class FactorEvaluator:
                 # 如果验证集计算失败（例如数据太短无法计算SMA），视为无效
                 return {'valid': False, 'reason': 'val_computation_failed'}
 
-            # 3. 添加因子并优化组合
+            # 3. 先试算：计算增量贡献（不修改池子）
             alpha_info = {
                 'tokens': tokens,
                 'timestamp': time.time(),
@@ -100,29 +100,53 @@ class FactorEvaluator:
                 'operators': self.operators
             }
 
-            result = self.combination_model.add_alpha_and_optimize(
+            # 🔥 Trial Mode: 计算增量Sharpe
+            trial_result = self.combination_model.evaluate_new_factor(
                 alpha_info, train_factor, val_factor
             )
 
-            # 获取分数
-            train_score = result.get('current_train_score', 0.0)
-            val_score = result.get('current_val_score', 0.0)
+            incremental_sharpe = trial_result.get('train_incremental_sharpe', 0.0)
+            train_stats = trial_result.get('train_stats', {'sharpe': 0.0, 'composite_score': 0.0})
+            val_stats = trial_result.get('val_stats', {'sharpe': 0.0, 'composite_score': 0.0})
 
+            # 4. 决策：是否真正添加到池子
+            # 使用配置中的IC阈值作为增量Sharpe阈值
+            ic_threshold = getattr(self.combination_model.config, 'ic_threshold', 0.02)
+            should_add = incremental_sharpe > ic_threshold
+
+            current_pool_size = len(self.combination_model.alpha_pool)
+
+            if should_add:
+                # 🔥 Commit Mode: 真正添加到池子
+                commit_result = self.combination_model.add_alpha_and_optimize(
+                    alpha_info, train_factor, val_factor
+                )
+                current_pool_size = commit_result.get('pool_size', current_pool_size)
+                train_score_after = commit_result.get('current_train_score', 0.0)
+                val_score_after = commit_result.get('current_val_score', 0.0)
+            else:
+                # 不添加，保持原有分数
+                train_score_after = train_stats.get('sharpe', 0.0)
+                val_score_after = val_stats.get('sharpe', 0.0)
+
+            # 5. 返回结果（奖励是增量Sharpe）
             return {
                 'valid': True,
-                'reward': train_score,
-                'pool_size': result.get('pool_size', 0),
+                'reward': incremental_sharpe,  # 🔥 核心修复：返回增量而非总分
+                'pool_size': current_pool_size,
+                'added_to_pool': should_add,
+                'incremental_sharpe': incremental_sharpe,
                 'train_eval': {
-                    'sharpe': train_score,
-                    'ic': train_score * 0.1,  # 近似IC，基于sharpe估算
-                    'composite_score': train_score
+                    'sharpe': train_score_after,
+                    'ic': incremental_sharpe * 0.5,  # IC和增量Sharpe相关
+                    'composite_score': incremental_sharpe
                 },
                 'val_eval': {
-                    'sharpe': val_score,
-                    'ic': val_score * 0.1,  # 近似IC
-                    'composite_score': val_score
+                    'sharpe': val_score_after,
+                    'ic': incremental_sharpe * 0.5,
+                    'composite_score': val_stats.get('composite_score', 0.0)
                 },
-                'composite_score': train_score
+                'composite_score': incremental_sharpe  # 🔥 这里也改为增量
             }
 
         except Exception as e:
