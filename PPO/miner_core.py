@@ -621,6 +621,9 @@ class FactorMinerCore:
                     final_reward = eval_result['reward']
                 else:
                     final_reward = -1.0
+                    # 调试：记录失败原因
+                    if iteration < 3:  # 只在前几次迭代打印
+                        logger.debug(f"Expression invalid: {tokens}, reason: {eval_result.get('reason', 'unknown')}")
 
                 raw_rewards.append(final_reward)
                 eval_results.append(eval_result)

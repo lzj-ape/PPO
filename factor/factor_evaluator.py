@@ -95,7 +95,9 @@ class FactorEvaluator:
                 'tokens': tokens,
                 'timestamp': time.time(),
                 # 保存统计量，以便将来实盘生成时复用
-                'stats': self.current_factor_stats 
+                'stats': self.current_factor_stats,
+                # 保存operators引用，供回测使用
+                'operators': self.operators
             }
 
             result = self.combination_model.add_alpha_and_optimize(
@@ -124,7 +126,9 @@ class FactorEvaluator:
             }
 
         except Exception as e:
-            # logger.debug(f"Expression evaluation error: {e}")
+            logger.debug(f"Expression evaluation error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return {'valid': False, 'reason': str(e)}
 
     def compute_factor_values(self, expr_tokens: List[str], data: pd.DataFrame, is_training: bool = False) -> Optional[pd.Series]:

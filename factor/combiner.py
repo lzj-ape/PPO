@@ -18,20 +18,21 @@ class ImprovedCombinationModel:
     def __init__(self, config: TrainingConfig, max_alpha_count: int = 15):
         self.config = config
         self.max_alpha_count = max_alpha_count
-        
+        self.combiner_type = config.combiner_type  # 添加combiner_type属性
+
         # 因子池信息
         self.alpha_pool: List[Dict] = []
-        
+
         # 因子数据矩阵
         self.train_matrix: Optional[pd.DataFrame] = None
         self.val_matrix: Optional[pd.DataFrame] = None
-        
+
         # 目标值
         self.train_target: Optional[pd.Series] = None
         self.val_target: Optional[pd.Series] = None
-        
+
         # 模型与状态
-        self.ridge_model = Ridge(alpha=1.0, fit_intercept=False) 
+        self.ridge_model = Ridge(alpha=1.0, fit_intercept=False)
         self.current_weights: Optional[np.ndarray] = None
         self.evaluator = None # 类型: ICDiversityEvaluator
         
@@ -40,7 +41,7 @@ class ImprovedCombinationModel:
         self.base_val_score = 0.0
         
         # Rolling Sharpe 的参数
-        self.rolling_window_days = getattr(config, 'rolling_window_days', 90)
+        self.rolling_window_days = getattr(config, 'rolling_window_days', 3)
         self.stability_penalty = getattr(config, 'stability_penalty', 1.5)
 
     def set_evaluator(self, evaluator):
@@ -223,3 +224,10 @@ class ImprovedCombinationModel:
         """返回当前的组合表现"""
         score = self.base_val_score if use_val else self.base_train_score
         return {'sharpe': score, 'composite_score': score}
+
+    @property
+    def weights(self):
+        """兼容性属性：返回当前权重"""
+        if self.current_weights is not None:
+            return self.current_weights.tolist()
+        return []

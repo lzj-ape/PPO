@@ -10,28 +10,28 @@ __version__ = "2.0.0"
 __author__ = "Factor Mining Team"
 
 # 导入主要类
-from config import TrainingConfig
-from operators import TimeSeriesOperators
-from evaluator import SharpeICEvaluator
-from networks import ActorCriticNetwork, LSTMFeatureExtractor
-from buffer import PPOBuffer
-from combiner import LSTMFactorCombiner, ImprovedCombinationModel
-from miner import OptimizedSynergisticFactorMiner
-from backtest import SimpleBacktest
-from utils import setup_logging, get_device
+from config.config import TrainingConfig
+from factor.operators import TimeSeriesOperators
+from factor.evaluator import ICDiversityEvaluator
+from PPO.networks import ActorCriticNetwork, LSTMFeatureExtractor, LSTMFactorCombiner
+from PPO.buffer import PPOBuffer
+from factor.combiner import ImprovedCombinationModel
+from PPO.miner_new import OptimizedSynergisticFactorMiner
+from backtest.backtest import Backtester, MinerBacktester
+from utils.utils import setup_logging, get_device
 
 __all__ = [
     'TrainingConfig',
     'TimeSeriesOperators',
-    'SharpeICEvaluator',
+    'ICDiversityEvaluator',
     'ActorCriticNetwork',
     'LSTMFeatureExtractor',
     'PPOBuffer',
     'LSTMFactorCombiner',
     'ImprovedCombinationModel',
     'OptimizedSynergisticFactorMiner',
-    'RollingSignalGenerator',
-    'CryptoBacktest',
+    'Backtester',
+    'MinerBacktester',
     'setup_logging',
     'get_device',
 ]

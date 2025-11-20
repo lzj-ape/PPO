@@ -1,6 +1,4 @@
-"""
-配置模块 - 训练和模型参数配置
-"""
+
 
 from dataclasses import dataclass
 
