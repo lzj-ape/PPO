@@ -6,16 +6,16 @@ from dataclasses import dataclass
 @dataclass
 class TrainingConfig:
     """训练配置 - 实盘优化版 v2"""
-    # 🔥 模型参数（进一步降低学习率，配合新的reward设计）
-    lr_actor: float = 1e-5       # 从5e-5降到1e-5（reward范围缩小后需要更小lr）
-    lr_critic: float = 1e-5      # 从5e-5降到1e-5
+    # 🔥 模型参数（恢复正常学习率，避免策略不更新）
+    lr_actor: float = 3e-4       # 恢复到正常学习率
+    lr_critic: float = 3e-4      # 恢复到正常学习率
     hidden_dim: int = 128
     lstm_layers: int = 2
     batch_size: int = 32
     ppo_epochs: int = 4
     clip_param: float = 0.2
     value_clip_param: float = 1.0  # 从0.2提升到1.0（配合奖励归一化）
-    entropy_coeff: float = 0.02    # 从0.01提升到0.02（增加探索）
+    entropy_coeff: float = 0.05    # 提升到0.05以增加探索，避免只生成简单因子
     value_coeff: float = 0.5
     max_grad_norm: float = 0.5
     gamma: float = 0.99            # 从0.95提升到0.99（更重视早期步骤）
@@ -46,7 +46,10 @@ class TrainingConfig:
     rebalance_mode: str = 'non_overlapping'
     
     # 因子筛选阈值
-    ic_threshold: float = 0.02  # IC绝对值阈值（正负IC都需要达到此绝对值）
+    # 🔥 增量Sharpe阈值：只有带来实质性改进的因子才被接受
+    # 降低阈值以允许更多因子进入池子，特别是在初期
+    # 使用自适应策略：当池子很小时用更低的阈值，池子大时再提高
+    ic_threshold: float = 0.01  # 增量Sharpe阈值（降低到0.01以增加因子多样性）
 
     # 🔥 高级Reward配置（新增）
     reward_type: str = 'hybrid'  # 'incremental', 'penalized', 'stable', 'hybrid', 'full'

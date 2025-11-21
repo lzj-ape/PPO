@@ -610,15 +610,26 @@ class FactorMinerCore:
             # 生成表达式batch
             batch_results = self.expr_generator.generate_expression_batch(batch_size)
 
-            # 评估表达式
+            # 🔥 阶段1: 纯试算（Trial）- 在统一的基准环境下评估所有因子
+            # 避免因子顺序依赖导致的奖励不一致
             raw_rewards = []
             eval_results = []
+            valid_candidates = []  # 记录合格候选因子
 
-            for tokens, state_ids, trajectory in batch_results:
-                eval_result = self.factor_evaluator.evaluate_expression(tokens)
+            for idx, (tokens, state_ids, trajectory) in enumerate(batch_results):
+                # trial_only=True: 只计算奖励，不添加到池子
+                eval_result = self.factor_evaluator.evaluate_expression(tokens, trial_only=True)
 
                 if eval_result['valid']:
                     final_reward = eval_result['reward']
+                    # 记录合格候选因子（达到阈值）
+                    if eval_result.get('qualifies', False):
+                        valid_candidates.append({
+                            'idx': idx,
+                            'tokens': tokens,
+                            'reward': final_reward,
+                            'eval_result': eval_result
+                        })
                 else:
                     # 🔥 无效表达式给予小的负奖励，而非-1.0
                     # 这样PPO能学习到"避免无效表达式"但不会被过大的惩罚干扰
@@ -630,10 +641,31 @@ class FactorMinerCore:
                 raw_rewards.append(final_reward)
                 eval_results.append(eval_result)
 
+            # 🔥 阶段2: 选择并提交（Commit）- 只提交本batch中最好的因子
+            # 这样避免了同一batch内的因子相互影响奖励
+            if valid_candidates:
+                # 按奖励排序，选择top-1
+                valid_candidates.sort(key=lambda x: x['reward'], reverse=True)
+                best_candidate = valid_candidates[0]
+                best_eval = best_candidate['eval_result']
+
+                # 🔥 检查是否真的qualifies（达到阈值）
+                if best_eval.get('qualifies', False):
+                    # 真正提交最佳候选
+                    commit_result = self.combination_model.add_alpha_and_optimize(
+                        best_eval['alpha_info'],
+                        best_eval['train_factor'],
+                        best_eval['val_factor']
+                    )
+                    logger.debug(f"✅ Batch best factor committed (reward={best_candidate['reward']:.4f}), pool_size={commit_result.get('pool_size', 0)}")
+                else:
+                    logger.debug(f"❌ Batch best factor not qualified (reward={best_candidate['reward']:.4f}), skipping commit")
+
             # 🔥 移除归一化！直接使用原始增量Sharpe作为奖励
             # 原因：增量Sharpe是稀疏但真实的信号，归一化会破坏其意义
-            # 只做简单的clip防止极端值
-            clipped_rewards = [np.clip(r, -2.0, 5.0) for r in raw_rewards]
+            # 调整clip范围：允许更大的正奖励以鼓励探索高质量因子
+            # 同时保持适度的负奖励惩罚以避免过度惩罚
+            clipped_rewards = [np.clip(r, -1.0, 10.0) for r in raw_rewards]
 
             # 添加到buffer
             for i in range(batch_size):
@@ -689,11 +721,24 @@ class FactorMinerCore:
                 (iteration % train_interval == 0 and len(self.ppo_buffer) >= min_buffer_size)):
 
                 self.ppo_update_count += 1
+                logger.info(f"🔄 PPO Update #{self.ppo_update_count} at iteration {iteration}")
+                logger.info(f"  Buffer size: {len(self.ppo_buffer)}")
+
                 train_stats = self.ppo_trainer.train_ppo_step(
                     self.expr_generator._get_valid_actions
                 )
 
                 if train_stats:
+                    # 🔥 打印PPO训练详细信息
+                    logger.info(f"  PPO Training Stats:")
+                    logger.info(f"    Policy Loss: {train_stats.get('policy_loss', 0.0):.6f}")
+                    logger.info(f"    Value Loss: {train_stats.get('value_loss', 0.0):.6f}")
+                    logger.info(f"    Entropy Loss: {train_stats.get('entropy_loss', 0.0):.6f}")
+                    logger.info(f"    Advantage - Mean: {train_stats.get('advantage_mean', 0.0):.4f}, Std: {train_stats.get('advantage_std', 0.0):.4f}")
+                    logger.info(f"    Value - Mean: {train_stats.get('value_mean', 0.0):.4f}, Std: {train_stats.get('value_std', 0.0):.4f}")
+                    logger.info(f"    Learning Rate: {train_stats.get('learning_rate', 0.0):.6f}")
+
+                    # 记录到训练历史
                     self.training_history['ppo_update_iterations'].append(iteration)
                     for key, value in train_stats.items():
                         if f'{key}s' not in self.training_history:
@@ -722,6 +767,36 @@ class FactorMinerCore:
                 logger.info(f"  Avg Reward: {avg_reward:.4f}")
                 logger.info(f"  Best VAL: {best_val_score:.4f}")
                 logger.info(f"  Pool Size: {len(self.combination_model.alpha_pool)}")
+
+                # 🔥 打印最佳因子组合信息
+                if len(self.combination_model.alpha_pool) > 0:
+                    logger.info(f"  Current Best Factor Combination:")
+                    logger.info(f"    Train Score: {iter_end_train_eval['composite_score']:.4f}")
+                    logger.info(f"    Val Score: {iter_end_val_eval['composite_score']:.4f}")
+
+                    # 显示权重最大的前3个因子
+                    if self.combination_model.current_weights is not None and len(self.combination_model.current_weights) > 0:
+                        weights = self.combination_model.current_weights
+                        abs_weights = np.abs(weights)
+                        top_indices = np.argsort(abs_weights)[-3:][::-1]
+
+                        logger.info(f"    Top 3 Factors by Weight:")
+                        for rank, idx in enumerate(top_indices, 1):
+                            if idx < len(self.combination_model.alpha_pool):
+                                factor_info = self.combination_model.alpha_pool[idx]
+                                tokens = factor_info.get('tokens', [])
+                                weight = weights[idx]
+                                contribution = self.combination_model.factor_contributions[idx] if idx < len(self.combination_model.factor_contributions) else 0.0
+                                logger.info(f"      #{rank}: weight={weight:.4f}, incremental_contribution={contribution:.4f}")
+                                logger.info(f"          expression: {' '.join(tokens)}")
+                    else:
+                        # 🔥 只有1个因子或没有权重时,直接显示因子信息
+                        logger.info(f"    Factors in Pool:")
+                        for idx, factor_info in enumerate(self.combination_model.alpha_pool[:3]):
+                            tokens = factor_info.get('tokens', [])
+                            contribution = self.combination_model.factor_contributions[idx] if idx < len(self.combination_model.factor_contributions) else 0.0
+                            logger.info(f"      #{idx+1}: incremental_contribution={contribution:.4f}")
+                            logger.info(f"          expression: {' '.join(tokens)}")
 
         # 恢复最佳模型
         if self.best_model_state is not None:

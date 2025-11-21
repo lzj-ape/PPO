@@ -67,72 +67,117 @@ class ICDiversityEvaluator:
         except:
             return 0.0
 
-    def calculate_rolling_sharpe_stability(self, predictions: pd.Series, targets: pd.Series, 
-                                          window_days: int = 90, stability_penalty: float = 1.5) -> float:
+    def calculate_rolling_sharpe_stability(self, predictions: pd.Series, targets: pd.Series,
+                                          window_days: int = 3, stability_penalty: float = 1.5) -> float:
         """
         🔥 计算滚动夏普的稳定性得分
         Score = Mean(Rolling_Sharpe) - lambda * Std(Rolling_Sharpe)
+
+        注意：这里的window_days默认为3天，对应15分钟K线约288根
         """
         try:
             # 1. 计算净值曲线 (Net Returns)
             net_returns = self._get_net_returns(predictions, targets)
-            
-            if len(net_returns) < window_days * 2: return 0.0
-            
-            # 2. 计算滚动 Sharpe
+
+            # 🔥 修复：需要足够的数据才能计算滚动指标
             bars_per_day = 24 * 60 / max(self.bar_minutes, 1)
-            window_bars = int(window_days * bars_per_day)
-            
+            window_bars = max(int(window_days * bars_per_day), 50)  # 至少50根K线
+            min_required_bars = window_bars * 3  # 至少3个窗口的数据
+
+            if len(net_returns) < min_required_bars:
+                return 0.0
+
+            # 2. 计算滚动 Sharpe
             # 滚动计算均值和标准差
-            rolling_mean = net_returns.rolling(window=window_bars).mean()
-            rolling_std = net_returns.rolling(window=window_bars).std()
-            
+            rolling_mean = net_returns.rolling(window=window_bars, min_periods=window_bars//2).mean()
+            rolling_std = net_returns.rolling(window=window_bars, min_periods=window_bars//2).std()
+
+            # 🔥 修复：添加更严格的标准差检查
+            # 如果波动率太小（接近0），说明策略没有真实交易或信号太弱
+            rolling_std = rolling_std.replace(0, np.nan)
+
             # 滚动年化 Sharpe
             rolling_sharpe = (rolling_mean / (rolling_std + 1e-9)) * np.sqrt(self.bars_per_year)
             rolling_sharpe = rolling_sharpe.dropna()
-            
-            # 剔除极端值
+
+            # 🔥 Clip滚动Sharpe：防止单个窗口数据异常导致爆炸
+            # 但不要clip得太紧，真实的优秀策略可能达到3-5
             rolling_sharpe = rolling_sharpe.clip(-5, 5)
-            
-            if len(rolling_sharpe) < 10: return 0.0
-            
+
+            if len(rolling_sharpe) < 10:
+                return 0.0
+
             # 3. 计算稳定性得分
             mean_s = rolling_sharpe.mean()
             std_s = rolling_sharpe.std()
-            
+
+            # 🔥 修复：如果标准差为0（所有窗口Sharpe相同），这很可能是数据问题
+            if std_s < 1e-6:
+                # 惩罚这种异常情况
+                return 0.0
+
             # 核心公式：平均表现 - 不确定性惩罚
             stability_score = mean_s - stability_penalty * std_s
-            
+
+            # 🔥 最终clip：只防止数据异常导致的爆炸（NaN/Inf），不限制合理高分
+            # 扩大到[-10, 10]，为增量Sharpe留出足够的区分空间
+            # 这样即使base_score达到5，新因子仍可能带来5的增量
+            stability_score = np.clip(stability_score, -10.0, 10.0)
+
             return float(stability_score)
-            
+
         except Exception as e:
-            # logger.warning(f"Error in stability calc: {e}")
+            logger.warning(f"Error in stability calc: {e}")
             return 0.0
 
     def _get_net_returns(self, predictions: pd.Series, targets: pd.Series) -> pd.Series:
-        """辅助函数：提取净值收益逻辑"""
+        """
+        辅助函数：将因子预测值转换为交易信号，并计算净收益
+
+        逻辑：
+        1. 使用滚动z-score生成信号（>1做多，<-1做空）
+        2. 信号 * 未来收益 = 总收益
+        3. 减去交易成本
+        """
         valid_idx = predictions.index.intersection(targets.index)
-        if len(valid_idx) < 100: return pd.Series([], dtype=float)
-        
+        if len(valid_idx) < 100:
+            return pd.Series([], dtype=float)
+
         pred_val = predictions.loc[valid_idx]
         target_val = targets.loc[valid_idx]
-        
+
+        # 🔥 修复：确保predictions有足够的波动，否则z-score无意义
+        if pred_val.std() < 1e-10:
+            # 因子值几乎不变，无法生成有效信号
+            return pd.Series([], dtype=float)
+
         lookback = max(int(self.sharpe_signal_lookback), 20)
-        min_periods = min(lookback, 20)
-        
+        min_periods = min(lookback // 2, 20)
+
         # 简单的滚动 z-score 信号
         roll = pred_val.rolling(window=lookback, min_periods=min_periods)
         mu = roll.mean()
-        sigma = roll.std() + 1e-9
-        z_scores = (pred_val - mu) / sigma
-        
+        sigma = roll.std()
+
+        # 🔥 修复：如果sigma为0，无法计算z-score
+        sigma = sigma.replace(0, np.nan)
+        z_scores = (pred_val - mu) / (sigma + 1e-9)
+
+        # 生成交易信号
         signals = pd.Series(0.0, index=pred_val.index)
         signals[z_scores > 1.0] = self.max_position
         signals[z_scores < -1.0] = -self.max_position
-        
+
+        # 🔥 如果信号几乎不变（标准差<0.01），说明策略没有真实交易
+        if signals.std() < 0.01:
+            return pd.Series([], dtype=float)
+
+        # 计算收益
         gross_returns = signals * target_val
         cost = signals.diff().abs().fillna(0.0) * self.transaction_cost
-        return (gross_returns - cost).dropna()
+        net_returns = (gross_returns - cost).dropna()
+
+        return net_returns
 
     def _get_incremental_sharpe(self, predictions: pd.Series, targets: pd.Series, use_val: bool) -> float:
         """

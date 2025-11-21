@@ -97,6 +97,7 @@ class PPOTrainer:
 
             policy_losses = []
             value_losses = []
+            all_entropies = []
 
             indices = torch.randperm(len(batch['states']))
             batch_size = min(self.config.batch_size, len(indices))
@@ -246,12 +247,17 @@ class PPOTrainer:
 
                     policy_losses.append(policy_loss.item())
                     value_losses.append(value_loss.item())
+                    all_entropies.extend([e.item() for e in entropies])
 
             self.ppo_buffer.clear()
+
+            # 计算平均熵损失
+            avg_entropy = np.mean(all_entropies) if all_entropies else 0.0
 
             return {
                 'policy_loss': np.mean(policy_losses) if policy_losses else 0.0,
                 'value_loss': np.mean(value_losses) if value_losses else 0.0,
+                'entropy_loss': -avg_entropy * self.config.entropy_coeff,  # 注意符号
                 'learning_rate': self.config.lr_actor,
                 'advantage_mean': float(advantages.mean().item()),
                 'advantage_std': float(advantages.std().item()),

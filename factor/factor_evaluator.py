@@ -8,6 +8,20 @@ import pandas as pd
 import logging
 from typing import Dict, List, Optional
 import time
+import sys
+from pathlib import Path
+
+# 添加utils目录到路径
+utils_path = Path(__file__).parent.parent / 'utils'
+if str(utils_path) not in sys.path:
+    sys.path.insert(0, str(utils_path))
+
+try:
+    from advanced_reward import AdvancedRewardCalculator, RewardConfig
+    ADVANCED_REWARD_AVAILABLE = True
+except ImportError:
+    ADVANCED_REWARD_AVAILABLE = False
+    logging.warning("AdvancedRewardCalculator not available, using simple reward")
 
 logger = logging.getLogger(__name__)
 
@@ -48,17 +62,34 @@ class FactorEvaluator:
         self.val_data = val_data
         self.train_target = train_target
         self.val_target = val_target
-        
+
         # 🔥 新增：用于缓存当前正在评估的因子的训练集统计量
         # 格式: {'median': float, 'lower': float, 'upper': float}
         self.current_factor_stats = None
 
-    def evaluate_expression(self, tokens: List[str]) -> Dict:
+        # 🔥 初始化高级奖励计算器
+        if ADVANCED_REWARD_AVAILABLE:
+            # 使用简化配置：只启用惩罚项，不使用增量Sharpe（因为我们已经在combiner中计算）
+            reward_config = RewardConfig(
+                use_incremental_sharpe=False,  # 不重复计算增量
+                use_penalty=True,  # 启用惩罚项
+                use_rolling_stability=False,  # 数据量小时关闭
+                complexity_lambda=0.3,
+                turnover_gamma=2.0,
+                max_expr_length=30
+            )
+            self.reward_calculator = AdvancedRewardCalculator(reward_config)
+            logger.info("✅ AdvancedRewardCalculator enabled (penalty mode)")
+        else:
+            self.reward_calculator = None
+
+    def evaluate_expression(self, tokens: List[str], trial_only: bool = False) -> Dict:
         """
         评估表达式
 
         Args:
             tokens: token列表
+            trial_only: 是否仅试算不提交（True=只计算奖励，False=根据阈值决定是否添加）
 
         Returns:
             评估结果字典
@@ -110,11 +141,27 @@ class FactorEvaluator:
             val_stats = trial_result.get('val_stats', {'sharpe': 0.0, 'composite_score': 0.0})
 
             # 4. 决策：是否真正添加到池子
-            # 使用配置中的IC阈值作为增量Sharpe阈值
-            ic_threshold = getattr(self.combination_model.config, 'ic_threshold', 0.02)
-            should_add = incremental_sharpe > ic_threshold
-
+            # 🔥 自适应阈值：池子越小，阈值越低
+            base_threshold = getattr(self.combination_model.config, 'ic_threshold', 0.01)
             current_pool_size = len(self.combination_model.alpha_pool)
+
+            # 当池子小于5时，使用更低的阈值以鼓励多样性
+            if current_pool_size < 3:
+                ic_threshold = base_threshold * 0.5  # 前3个因子用0.5倍阈值
+            elif current_pool_size < 5:
+                ic_threshold = base_threshold * 0.75  # 第4-5个因子用0.75倍阈值
+            else:
+                ic_threshold = base_threshold  # 之后用正常阈值
+
+            should_add = incremental_sharpe > ic_threshold and not trial_only
+            actually_added = False
+
+            # 🔥 诊断日志：记录拒绝的原因
+            if not trial_only and incremental_sharpe <= ic_threshold:
+                if current_pool_size <= 10:  # 在前10个因子时打印详细信息
+                    logger.info(f"❌ Factor rejected: incremental_sharpe={incremental_sharpe:.4f} <= adaptive_threshold={ic_threshold:.4f} (base={base_threshold:.4f})")
+                    logger.info(f"   base_score={self.combination_model.base_train_score:.4f}, new_score={trial_result['train_stats']['sharpe']:.4f}")
+                    logger.info(f"   expression: {' '.join(tokens[:10])}...")  # 只显示前10个token
 
             if should_add:
                 # 🔥 Commit Mode: 真正添加到池子
@@ -124,18 +171,64 @@ class FactorEvaluator:
                 current_pool_size = commit_result.get('pool_size', current_pool_size)
                 train_score_after = commit_result.get('current_train_score', 0.0)
                 val_score_after = commit_result.get('current_val_score', 0.0)
+                actually_added = True
+
+                # 🔥 记录成功添加
+                logger.info(f"✅ Factor ACCEPTED: incremental_sharpe={incremental_sharpe:.4f} > threshold={ic_threshold:.4f}")
+                logger.info(f"   Pool size: {current_pool_size-1} → {current_pool_size}")
+                logger.info(f"   Train score: {self.combination_model.base_train_score - incremental_sharpe:.4f} → {train_score_after:.4f}")
+                logger.info(f"   Expression: {' '.join(tokens[:15])}...")
             else:
                 # 不添加，保持原有分数
                 train_score_after = train_stats.get('sharpe', 0.0)
                 val_score_after = val_stats.get('sharpe', 0.0)
 
-            # 5. 返回结果（奖励是增量Sharpe）
+            # 5. 🔥 应用高级奖励计算（惩罚项）
+            final_reward = incremental_sharpe
+            penalty_components = {}
+
+            if self.reward_calculator is not None:
+                # 准备old/new评估数据
+                old_train_eval = {'sharpe': self.combination_model.base_train_score}
+                old_val_eval = {'sharpe': self.combination_model.base_val_score}
+                new_train_eval = train_stats
+                new_val_eval = val_stats
+
+                # 计算惩罚项（不包括增量Sharpe，因为我们已经有了）
+                penalty_result = self.reward_calculator.calculate_reward(
+                    new_train_eval=new_train_eval,
+                    new_val_eval=new_val_eval,
+                    old_train_eval=old_train_eval,
+                    old_val_eval=old_val_eval,
+                    alpha_info=alpha_info,
+                    combination_series=None,  # 暂不使用换手率惩罚
+                    evaluator=None
+                )
+
+                # 只取惩罚部分（不包括incremental_sharpe）
+                penalty_components = penalty_result.get('components', {})
+                complexity_penalty = penalty_components.get('complexity_penalty', 0.0)
+                overfitting_penalty = penalty_components.get('overfitting_penalty', 0.0)
+
+                # 最终奖励 = 增量Sharpe + 惩罚项
+                final_reward = incremental_sharpe + complexity_penalty + overfitting_penalty
+
+                # logger.debug(f"Reward breakdown: incremental={incremental_sharpe:.4f}, "
+                #            f"complexity={complexity_penalty:.4f}, overfitting={overfitting_penalty:.4f}, "
+                #            f"final={final_reward:.4f}")
+
+            # 6. 返回结果（奖励是增量Sharpe + 惩罚）
             return {
                 'valid': True,
-                'reward': incremental_sharpe,  # 🔥 核心修复：返回增量而非总分
+                'reward': final_reward,  # 🔥 核心修复：增量 + 惩罚
                 'pool_size': current_pool_size,
-                'added_to_pool': should_add,
+                'added_to_pool': actually_added,  # 是否真的被添加（trial_only时为False）
+                'qualifies': incremental_sharpe > ic_threshold,  # 是否达标
                 'incremental_sharpe': incremental_sharpe,
+                'penalty_components': penalty_components,
+                'train_factor': train_factor,  # 🔥 新增：返回因子数据供后续提交
+                'val_factor': val_factor,
+                'alpha_info': alpha_info,
                 'train_eval': {
                     'sharpe': train_score_after,
                     'ic': incremental_sharpe * 0.5,  # IC和增量Sharpe相关
@@ -146,13 +239,13 @@ class FactorEvaluator:
                     'ic': incremental_sharpe * 0.5,
                     'composite_score': val_stats.get('composite_score', 0.0)
                 },
-                'composite_score': incremental_sharpe  # 🔥 这里也改为增量
+                'composite_score': final_reward  # 🔥 这里也改为最终奖励
             }
 
         except Exception as e:
-            logger.debug(f"Expression evaluation error: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
+            # logger.debug(f"Expression evaluation error: {e}")
+            # import traceback
+            # logger.debug(traceback.format_exc())
             return {'valid': False, 'reason': str(e)}
 
     def compute_factor_values(self, expr_tokens: List[str], data: pd.DataFrame, is_training: bool = False) -> Optional[pd.Series]:

@@ -65,17 +65,17 @@ class ImprovedCombinationModel:
         
         return X_clean, y_clean
 
-    def evaluate_new_factor(self, alpha_info: Dict, 
+    def evaluate_new_factor(self, alpha_info: Dict,
                            train_factor: pd.Series, val_factor: pd.Series) -> Dict:
         """
-        🔥 试算模式 (Trial Mode): 仅计算增量稳定性，不修改池子。
+        🔥 试算模式 (Trial Mode): 仅计算增量稳定性，不修改池子和模型状态。
         """
-        if self.evaluator is None or self.train_target is None: 
+        if self.evaluator is None or self.train_target is None:
             return {'train_incremental_sharpe': 0.0, 'train_stats': {'sharpe': 0.0}, 'val_stats': {'sharpe': 0.0}}
 
         # 1. 对齐新因子数据到 Target 索引 (关键修复：防止索引错位)
         train_factor_aligned = train_factor.reindex(self.train_target.index).fillna(0.0)
-        
+
         # 2. 构造临时训练矩阵
         if self.train_matrix is None or len(self.alpha_pool) == 0:
             # Case A: 池子为空
@@ -87,31 +87,33 @@ class ImprovedCombinationModel:
             current_X = self.train_matrix.reindex(self.train_target.index).fillna(0.0)
             temp_train_X = pd.concat([current_X, train_factor_aligned.rename('new')], axis=1)
 
-        # 3. 拟合 Ridge 回归 (在 Train 上)
+        # 3. 🔥 创建临时模型（不污染 self.ridge_model）
         X_train, y_train = self._align_and_clean(temp_train_X, self.train_target)
-        
-        if len(X_train) < 100: 
+
+        if len(X_train) < 100:
             return {'train_incremental_sharpe': 0.0, 'train_stats': {'sharpe': 0.0}, 'val_stats': {'sharpe': 0.0}}
-        
+
         try:
-            # 拟合
-            self.ridge_model.fit(X_train.values, y_train.values)
-            
+            # 🔥 使用临时模型进行拟合，避免污染主模型状态
+            from sklearn.linear_model import Ridge
+            temp_model = Ridge(alpha=1.0, fit_intercept=False)
+            temp_model.fit(X_train.values, y_train.values)
+
             # 预测组合收益
-            train_pred_vals = self.ridge_model.predict(X_train.values)
+            train_pred_vals = temp_model.predict(X_train.values)
             train_pred_series = pd.Series(train_pred_vals, index=X_train.index)
-            
+
             # 计算新的 Stability Score
             new_train_score = self.evaluator.calculate_rolling_sharpe_stability(
                 train_pred_series, y_train,
                 window_days=self.rolling_window_days, stability_penalty=self.stability_penalty
             )
-            
+
             # 4. 计算增量 (Reward)
             incremental_score = new_train_score - self.base_train_score
-            
+
             return {
-                'train_incremental_sharpe': incremental_score, 
+                'train_incremental_sharpe': incremental_score,
                 'train_stats': {'sharpe': new_train_score, 'composite_score': new_train_score},
                 # Val stats 暂略，以节省计算资源
                 'val_stats': {'sharpe': 0.0, 'composite_score': 0.0},
@@ -157,7 +159,11 @@ class ImprovedCombinationModel:
 
         if len(X_train) > 100:
             self.ridge_model.fit(X_train.values, y_train.values)
-            self.current_weights = self.ridge_model.coef_
+            # 🔥 修复：确保coef_是一维数组
+            if hasattr(self.ridge_model.coef_, 'flatten'):
+                self.current_weights = self.ridge_model.coef_.flatten()
+            else:
+                self.current_weights = np.atleast_1d(self.ridge_model.coef_)
 
             # 4. 🔥 更新基准 Rolling Stability Score
             train_pred_vals = self.ridge_model.predict(X_train.values)
