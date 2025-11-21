@@ -99,27 +99,43 @@ class FactorEvaluator:
 
         try:
             expr_tokens = tokens[1:-1]
-            
+
             # 🔥 重置统计量缓存，开始新一轮评估
             self.current_factor_stats = None
 
             # 1. 在训练集上计算因子值 (Compute & Learn Stats)
             # 注意：必须先算训练集，这样 _clean_series 才能计算并保存统计量
             train_factor = self.compute_factor_values(expr_tokens, self.train_data, is_training=True)
-            
+
             if train_factor is None:
                 return {'valid': False, 'reason': 'train_computation_failed'}
-                
+
             if self.current_factor_stats is None:
                 return {'valid': False, 'reason': 'stats_computation_failed'}
 
             # 2. 在验证集上计算因子值 (Compute & Apply Stats)
             # 这里会使用上一步缓存的统计量进行清洗，严禁使用验证集自己的统计量
             val_factor = self.compute_factor_values(expr_tokens, self.val_data, is_training=False)
-            
+
             if val_factor is None:
                 # 如果验证集计算失败（例如数据太短无法计算SMA），视为无效
                 return {'valid': False, 'reason': 'val_computation_failed'}
+
+            # 🔥 新增: 多样性检查 - 计算与池中现有因子的相似度
+            diversity_penalty = 0.0
+            if len(self.combination_model.alpha_pool) > 0:
+                similarity_score = self._calculate_expression_similarity(tokens)
+                # 相似度越高,惩罚越大
+                if similarity_score > 0.7:
+                    # 高度相似,重度惩罚
+                    diversity_penalty = -0.5 * similarity_score
+                elif similarity_score > 0.5:
+                    # 中度相似,中度惩罚
+                    diversity_penalty = -0.3 * similarity_score
+                elif similarity_score > 0.3:
+                    # 轻度相似,轻度惩罚
+                    diversity_penalty = -0.1 * similarity_score
+                # 否则不惩罚
 
             # 3. 先试算：计算增量贡献（不修改池子）
             alpha_info = {
@@ -205,9 +221,9 @@ class FactorEvaluator:
                 train_score_after = train_stats.get('sharpe', 0.0)
                 val_score_after = val_stats.get('sharpe', 0.0)
 
-            # 5. 🔥 应用高级奖励计算（惩罚项）
-            final_reward = incremental_sharpe
-            penalty_components = {}
+            # 5. 🔥 应用高级奖励计算（惩罚项 + 多样性惩罚）
+            final_reward = incremental_sharpe + diversity_penalty
+            penalty_components = {'diversity_penalty': diversity_penalty}
 
             if self.reward_calculator is not None:
                 # 准备old/new评估数据
@@ -228,21 +244,24 @@ class FactorEvaluator:
                 )
 
                 # 只取惩罚部分（不包括incremental_sharpe）
-                penalty_components = penalty_result.get('components', {})
-                complexity_penalty = penalty_components.get('complexity_penalty', 0.0)
-                overfitting_penalty = penalty_components.get('overfitting_penalty', 0.0)
+                penalty_components_extra = penalty_result.get('components', {})
+                complexity_penalty = penalty_components_extra.get('complexity_penalty', 0.0)
+                overfitting_penalty = penalty_components_extra.get('overfitting_penalty', 0.0)
 
-                # 最终奖励 = 增量Sharpe + 惩罚项
-                final_reward = incremental_sharpe + complexity_penalty + overfitting_penalty
+                # 更新penalty_components
+                penalty_components.update(penalty_components_extra)
+
+                # 最终奖励 = 增量Sharpe + 多样性惩罚 + 其他惩罚项
+                final_reward = incremental_sharpe + diversity_penalty + complexity_penalty + overfitting_penalty
 
                 # logger.debug(f"Reward breakdown: incremental={incremental_sharpe:.4f}, "
-                #            f"complexity={complexity_penalty:.4f}, overfitting={overfitting_penalty:.4f}, "
-                #            f"final={final_reward:.4f}")
+                #            f"diversity={diversity_penalty:.4f}, complexity={complexity_penalty:.4f}, "
+                #            f"overfitting={overfitting_penalty:.4f}, final={final_reward:.4f}")
 
             # 6. 返回结果（奖励是增量Sharpe + 惩罚）
             return {
                 'valid': True,
-                'reward': final_reward,  # 🔥 核心修复：增量 + 惩罚
+                'reward': final_reward,  # 🔥 核心修复：增量 + 多样性 + 惩罚
                 'pool_size': current_pool_size,
                 'added_to_pool': actually_added,  # 是否真的被添加（trial_only时为False）
                 'qualifies': incremental_sharpe > ic_threshold,  # 是否达标
@@ -269,6 +288,71 @@ class FactorEvaluator:
             # import traceback
             # logger.debug(traceback.format_exc())
             return {'valid': False, 'reason': str(e)}
+
+    def _calculate_expression_similarity(self, tokens: List[str]) -> float:
+        """
+        计算新表达式与池中现有表达式的最大相似度
+
+        相似度计算策略:
+        1. Token序列的Jaccard相似度
+        2. 结构相似度 (操作符序列)
+        3. 返回最大相似度分数
+
+        Args:
+            tokens: 新表达式的token列表
+
+        Returns:
+            最大相似度分数 [0, 1]
+        """
+        if len(self.combination_model.alpha_pool) == 0:
+            return 0.0
+
+        new_tokens_set = set(tokens[1:-1])  # 去掉<BEG>和<SEP>
+        new_operators = [t for t in tokens[1:-1] if t in self.operators]
+        new_features = [t for t in tokens[1:-1] if t in self.feature_names]
+
+        max_similarity = 0.0
+
+        for alpha_info in self.combination_model.alpha_pool:
+            existing_tokens = alpha_info['tokens']
+            existing_tokens_set = set(existing_tokens[1:-1])
+            existing_operators = [t for t in existing_tokens[1:-1] if t in self.operators]
+            existing_features = [t for t in existing_tokens[1:-1] if t in self.feature_names]
+
+            # 1. Token集合的Jaccard相似度
+            if len(new_tokens_set) > 0 and len(existing_tokens_set) > 0:
+                intersection = len(new_tokens_set & existing_tokens_set)
+                union = len(new_tokens_set | existing_tokens_set)
+                token_similarity = intersection / union if union > 0 else 0.0
+            else:
+                token_similarity = 0.0
+
+            # 2. 操作符序列相似度
+            if len(new_operators) > 0 and len(existing_operators) > 0:
+                common_ops = len(set(new_operators) & set(existing_operators))
+                total_ops = max(len(new_operators), len(existing_operators))
+                operator_similarity = common_ops / total_ops if total_ops > 0 else 0.0
+            else:
+                operator_similarity = 0.0
+
+            # 3. 特征序列相似度
+            if len(new_features) > 0 and len(existing_features) > 0:
+                common_features = len(set(new_features) & set(existing_features))
+                total_features = max(len(new_features), len(existing_features))
+                feature_similarity = common_features / total_features if total_features > 0 else 0.0
+            else:
+                feature_similarity = 0.0
+
+            # 综合相似度 (加权平均)
+            overall_similarity = (
+                0.4 * token_similarity +
+                0.4 * operator_similarity +
+                0.2 * feature_similarity
+            )
+
+            max_similarity = max(max_similarity, overall_similarity)
+
+        return max_similarity
 
     def compute_factor_values(self, expr_tokens: List[str], data: pd.DataFrame, is_training: bool = False) -> Optional[pd.Series]:
         """

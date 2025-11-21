@@ -163,12 +163,29 @@ class ExpressionGenerator:
 
     def _get_valid_actions(self, state: List[int]) -> Tuple[List[int], Dict[int, List[int]]]:
         """
-        层次化动作选择 - 增加数量级检查
+        层次化动作选择 - 严格保证RPN栈平衡
+
+        语法约束强化策略:
+        1. 最小长度: 至少 <BEG> feature operator <SEP> (len>=4)
+        2. 强制结束: stack==1 且 len>=4 → 必须输出 <SEP>
+        3. 禁止早停: stack!=1 → 禁止输出 <SEP>
+        4. 防止溢出: 接近max_len时提前强制结束
+        5. 操作符约束: 只有栈足够大时才能使用对应arity的操作符
 
         Returns:
             (valid_types, valid_actions_by_type)
         """
-        if len(state) >= self.max_expr_len:
+        current_len = len(state)
+        MIN_VALID_LEN = 4  # <BEG> feature op <SEP>
+
+        # 🔥 约束1: 接近最大长度时强制结束
+        # 留3个token的buffer: feature + operator + <SEP>
+        if current_len >= self.max_expr_len - 3:
+            # 如果已经达到最小长度且栈平衡,强制结束
+            stack_size = self._calculate_stack_size(state)
+            if stack_size == 1 and current_len >= MIN_VALID_LEN:
+                return [2], {2: [self.token_to_id['<SEP>']]}
+            # 否则也要强制结束(兜底,避免截断)
             return [2], {2: [self.token_to_id['<SEP>']]}
 
         stack_size = self._calculate_stack_size(state)
@@ -177,32 +194,47 @@ class ExpressionGenerator:
         valid_types = []
         valid_actions_by_type = {}
 
-        if stack_size >= 0:
-            # Type 0: Features
-            feature_actions = [self.token_to_id[f] for f in self.feature_names]
-            if feature_actions:
-                valid_types.append(0)
-                valid_actions_by_type[0] = feature_actions
+        # 🔥 约束2: 当stack==1且达到最小长度时,只能结束
+        if stack_size == 1 and current_len >= MIN_VALID_LEN:
+            return [2], {2: [self.token_to_id['<SEP>']]}
 
-            # Type 1: Operators - 增加数量级检查
+        # 🔥 约束3: 只有栈有效(stack>=0)时才能添加feature/operator
+        if stack_size >= 0:
+            # Type 0: Features - 确保添加后有足够空间完成表达式
+            # 添加feature后最少需要: operator(1) + <SEP>(1) = 2个token
+            if current_len + 2 < self.max_expr_len:
+                feature_actions = [self.token_to_id[f] for f in self.feature_names]
+                if feature_actions:
+                    valid_types.append(0)
+                    valid_actions_by_type[0] = feature_actions
+
+            # Type 1: Operators - 严格检查栈大小和数量级
             operator_actions = []
             for op_name, op_info in self.operators.items():
-                # 检查栈大小
-                if stack_size >= op_info['arity']:
+                arity = op_info['arity']
+
+                # 🔥 核心约束: 栈必须足够大才能应用该操作符
+                if stack_size >= arity:
                     # 检查数量级兼容性
                     if self._is_operator_scale_compatible(op_name, scale_stack):
-                        operator_actions.append(self.token_to_id[op_name])
+                        # 🔥 额外约束: 应用操作后栈大小会变为 stack - arity + 1
+                        # 必须确保应用后至少有1个元素(最终能结束)
+                        new_stack_size = stack_size - arity + 1
+                        if new_stack_size >= 1:
+                            operator_actions.append(self.token_to_id[op_name])
 
             if operator_actions:
                 valid_types.append(1)
                 valid_actions_by_type[1] = operator_actions
 
-        # Type 2: End
-        if stack_size == 1:
-            valid_types.append(2)
-            valid_actions_by_type[2] = [self.token_to_id['<SEP>']]
+        # Type 2: End - 🔥 约束4: 只有stack==1时才能结束
+        # 注意: 这里不添加,因为上面已经处理了stack==1的情况(强制返回)
+        # 这个分支永远不会执行,但保留作为逻辑完整性
 
+        # 🔥 约束5: 如果没有有效动作,强制结束(兜底,防止死锁)
         if not valid_types:
+            # 这种情况理论上不应该发生,但作为安全措施
+            logger.warning(f"No valid actions at state len={current_len}, stack={stack_size}, forcing <SEP>")
             return [2], {2: [self.token_to_id['<SEP>']]}
 
         return valid_types, valid_actions_by_type
