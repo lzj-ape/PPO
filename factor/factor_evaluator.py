@@ -145,26 +145,41 @@ class FactorEvaluator:
             base_threshold = getattr(self.combination_model.config, 'ic_threshold', 0.01)
             current_pool_size = len(self.combination_model.alpha_pool)
 
-            # 当池子小于5时，使用更低的阈值以鼓励多样性
+            # 🔥 修复：前期使用0阈值，允许所有有效因子进入
             if current_pool_size < 3:
-                ic_threshold = base_threshold * 0.5  # 前3个因子用0.5倍阈值
+                ic_threshold = 0.0  # 前3个因子：只要增量>0就接受
             elif current_pool_size < 5:
-                ic_threshold = base_threshold * 0.75  # 第4-5个因子用0.75倍阈值
+                ic_threshold = base_threshold * 0.3  # 第4-5个因子用0.3倍阈值
+            elif current_pool_size < 10:
+                ic_threshold = base_threshold * 0.6  # 第6-10个因子用0.6倍阈值
             else:
                 ic_threshold = base_threshold  # 之后用正常阈值
 
             should_add = incremental_sharpe > ic_threshold and not trial_only
             actually_added = False
 
-            # 🔥 诊断日志：记录拒绝的原因
+            # 🔥 诊断日志：记录拒绝的原因（显式打印）
             if not trial_only and incremental_sharpe <= ic_threshold:
-                if current_pool_size <= 10:  # 在前10个因子时打印详细信息
-                    logger.info(f"❌ Factor rejected: incremental_sharpe={incremental_sharpe:.4f} <= adaptive_threshold={ic_threshold:.4f} (base={base_threshold:.4f})")
-                    logger.info(f"   base_score={self.combination_model.base_train_score:.4f}, new_score={trial_result['train_stats']['sharpe']:.4f}")
-                    logger.info(f"   expression: {' '.join(tokens[:10])}...")  # 只显示前10个token
+                logger.info(f"❌ Factor REJECTED:")
+                logger.info(f"   incremental_sharpe={incremental_sharpe:.6f} <= threshold={ic_threshold:.6f}")
+                logger.info(f"   base_threshold={base_threshold:.6f}, pool_size={current_pool_size}")
+                logger.info(f"   base_train_score={self.combination_model.base_train_score:.4f}")
+                logger.info(f"   new_train_score={trial_result['train_stats']['sharpe']:.4f}")
+                logger.info(f"   expression: {' '.join(tokens[:15])}...")
+
+                # 🔥 额外诊断：分析为什么增量低
+                if incremental_sharpe <= 0:
+                    logger.info(f"   ⚠️  Reason: New factor does NOT improve the combination (negative/zero increment)")
+                elif self.combination_model.base_train_score > 2.0 and incremental_sharpe < 0.01:
+                    logger.info(f"   ⚠️  Reason: Base score is already high, hard to improve further")
+                else:
+                    logger.info(f"   ⚠️  Reason: Improvement too small (below threshold)")
 
             if should_add:
                 # 🔥 Commit Mode: 真正添加到池子
+                old_pool_size = len(self.combination_model.alpha_pool)
+                old_train_score = self.combination_model.base_train_score
+
                 commit_result = self.combination_model.add_alpha_and_optimize(
                     alpha_info, train_factor, val_factor
                 )
@@ -173,11 +188,18 @@ class FactorEvaluator:
                 val_score_after = commit_result.get('current_val_score', 0.0)
                 actually_added = True
 
-                # 🔥 记录成功添加
-                logger.info(f"✅ Factor ACCEPTED: incremental_sharpe={incremental_sharpe:.4f} > threshold={ic_threshold:.4f}")
-                logger.info(f"   Pool size: {current_pool_size-1} → {current_pool_size}")
-                logger.info(f"   Train score: {self.combination_model.base_train_score - incremental_sharpe:.4f} → {train_score_after:.4f}")
-                logger.info(f"   Expression: {' '.join(tokens[:15])}...")
+                # 🔥 记录成功添加（详细信息）
+                logger.info(f"✅ Factor ACCEPTED:")
+                logger.info(f"   incremental_sharpe={incremental_sharpe:.6f} > threshold={ic_threshold:.6f}")
+                logger.info(f"   Pool size: {old_pool_size} → {current_pool_size}")
+                logger.info(f"   Train score: {old_train_score:.4f} → {train_score_after:.4f} (Δ={train_score_after - old_train_score:.4f})")
+                logger.info(f"   Val score: {commit_result.get('current_val_score', 0.0):.4f}")
+                logger.info(f"   Expression: {' '.join(tokens[:20])}...")
+
+                # 显示当前池子中的因子数量和权重分布
+                if self.combination_model.current_weights is not None:
+                    weights = self.combination_model.current_weights
+                    logger.info(f"   Weight stats: mean={np.mean(np.abs(weights)):.4f}, max={np.max(np.abs(weights)):.4f}, min={np.min(np.abs(weights)):.4f}")
             else:
                 # 不添加，保持原有分数
                 train_score_after = train_stats.get('sharpe', 0.0)

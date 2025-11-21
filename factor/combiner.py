@@ -3,6 +3,7 @@ import pandas as pd
 import logging
 from typing import Dict, List, Tuple, Optional
 from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 from config import TrainingConfig
 # 注意：这里不再导入 ICDiversityEvaluator 以避免循环导入
 # 我们将在运行时通过 set_evaluator 注入实例
@@ -33,6 +34,7 @@ class ImprovedCombinationModel:
 
         # 模型与状态
         self.ridge_model = Ridge(alpha=1.0, fit_intercept=False)
+        self.scaler = StandardScaler()  # 🔥 添加标准化器
         self.current_weights: Optional[np.ndarray] = None
         self.evaluator = None # 类型: ICDiversityEvaluator
 
@@ -96,11 +98,35 @@ class ImprovedCombinationModel:
         try:
             # 🔥 使用临时模型进行拟合，避免污染主模型状态
             from sklearn.linear_model import Ridge
+            from sklearn.preprocessing import StandardScaler
             temp_model = Ridge(alpha=1.0, fit_intercept=False)
-            temp_model.fit(X_train.values, y_train.values)
+            temp_scaler = StandardScaler(with_mean=True, with_std=True)
+
+            # 🔥 修复 1: 健壮的标准化特征以避免 weight=0.0000 问题
+            try:
+                # 检查数据有效性
+                X_values = X_train.values
+                if np.isnan(X_values).any() or np.isinf(X_values).any():
+                    logger.warning("NaN/Inf detected in features before scaling, cleaning...")
+                    X_values = np.nan_to_num(X_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+                # 标准化（处理常数列）
+                X_train_scaled = temp_scaler.fit_transform(X_values)
+
+                # 🔥 防御性检查：如果标准化后出现NaN/Inf（可能是常数列导致）
+                if np.isnan(X_train_scaled).any() or np.isinf(X_train_scaled).any():
+                    logger.warning("Scaling produced NaN/Inf, using original values")
+                    X_train_scaled = X_values
+
+            except Exception as scale_error:
+                # 标准化失败时回退到原始值
+                logger.warning(f"StandardScaler failed: {scale_error}, using raw features")
+                X_train_scaled = X_train.values
+
+            temp_model.fit(X_train_scaled, y_train.values)
 
             # 预测组合收益
-            train_pred_vals = temp_model.predict(X_train.values)
+            train_pred_vals = temp_model.predict(X_train_scaled)
             train_pred_series = pd.Series(train_pred_vals, index=X_train.index)
 
             # 计算新的 Stability Score
@@ -120,6 +146,8 @@ class ImprovedCombinationModel:
             }
         except Exception as e:
             logger.error(f"Combiner trial failed: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return {'train_incremental_sharpe': 0.0, 'train_stats': {'sharpe': 0.0}, 'val_stats': {'sharpe': 0.0}}
 
     def add_alpha_and_optimize(self, alpha_info: Dict,
@@ -158,7 +186,24 @@ class ImprovedCombinationModel:
         X_train, y_train = self._align_and_clean(self.train_matrix, self.train_target)
 
         if len(X_train) > 100:
-            self.ridge_model.fit(X_train.values, y_train.values)
+            # 🔥 修复 1: 健壮的标准化特征以避免 weight=0.0000 问题
+            try:
+                X_values = X_train.values
+                # 清理 NaN/Inf
+                if np.isnan(X_values).any() or np.isinf(X_values).any():
+                    X_values = np.nan_to_num(X_values, nan=0.0, posinf=0.0, neginf=0.0)
+
+                X_train_scaled = self.scaler.fit_transform(X_values)
+
+                # 检查标准化结果
+                if np.isnan(X_train_scaled).any() or np.isinf(X_train_scaled).any():
+                    logger.warning("Scaling produced NaN/Inf in add_alpha_and_optimize, using raw features")
+                    X_train_scaled = X_values
+            except Exception as e:
+                logger.warning(f"StandardScaler failed in add_alpha_and_optimize: {e}, using raw features")
+                X_train_scaled = X_train.values
+
+            self.ridge_model.fit(X_train_scaled, y_train.values)
             # 🔥 修复：确保coef_是一维数组
             if hasattr(self.ridge_model.coef_, 'flatten'):
                 self.current_weights = self.ridge_model.coef_.flatten()
@@ -166,7 +211,7 @@ class ImprovedCombinationModel:
                 self.current_weights = np.atleast_1d(self.ridge_model.coef_)
 
             # 4. 🔥 更新基准 Rolling Stability Score
-            train_pred_vals = self.ridge_model.predict(X_train.values)
+            train_pred_vals = self.ridge_model.predict(X_train_scaled)
             train_pred_series = pd.Series(train_pred_vals, index=X_train.index)
 
             self.base_train_score = self.evaluator.calculate_rolling_sharpe_stability(
@@ -178,7 +223,19 @@ class ImprovedCombinationModel:
             if self.val_matrix is not None and self.val_target is not None:
                 X_val, y_val = self._align_and_clean(self.val_matrix, self.val_target)
                 if len(X_val) > 50:
-                    val_pred = self.ridge_model.predict(X_val.values)
+                    # 🔥 修复 1: 使用相同的标准化器对验证集进行变换
+                    try:
+                        X_val_values = X_val.values
+                        if np.isnan(X_val_values).any() or np.isinf(X_val_values).any():
+                            X_val_values = np.nan_to_num(X_val_values, nan=0.0, posinf=0.0, neginf=0.0)
+                        X_val_scaled = self.scaler.transform(X_val_values)
+                        if np.isnan(X_val_scaled).any() or np.isinf(X_val_scaled).any():
+                            X_val_scaled = X_val_values
+                    except Exception as e:
+                        logger.warning(f"Validation scaling failed: {e}, using raw features")
+                        X_val_scaled = X_val.values
+
+                    val_pred = self.ridge_model.predict(X_val_scaled)
                     self.base_val_score = self.evaluator.calculate_rolling_sharpe_stability(
                         pd.Series(val_pred, index=X_val.index), y_val,
                         window_days=self.rolling_window_days, stability_penalty=self.stability_penalty
@@ -242,11 +299,23 @@ class ImprovedCombinationModel:
         # 重新拟合以保持 base_score 准确
         X_train, y_train = self._align_and_clean(self.train_matrix, self.train_target)
         if len(X_train) > 100:
-            self.ridge_model.fit(X_train.values, y_train.values)
+            # 🔥 修复 1: 健壮的标准化特征
+            try:
+                X_values = X_train.values
+                if np.isnan(X_values).any() or np.isinf(X_values).any():
+                    X_values = np.nan_to_num(X_values, nan=0.0, posinf=0.0, neginf=0.0)
+                X_train_scaled = self.scaler.fit_transform(X_values)
+                if np.isnan(X_train_scaled).any() or np.isinf(X_train_scaled).any():
+                    X_train_scaled = X_values
+            except Exception as e:
+                logger.warning(f"Scaling failed in _prune_factor: {e}, using raw features")
+                X_train_scaled = X_train.values
+
+            self.ridge_model.fit(X_train_scaled, y_train.values)
             self.current_weights = self.ridge_model.coef_
 
             # 更新 Base Score
-            train_pred = self.ridge_model.predict(X_train.values)
+            train_pred = self.ridge_model.predict(X_train_scaled)
             self.base_train_score = self.evaluator.calculate_rolling_sharpe_stability(
                 pd.Series(train_pred, index=X_train.index), y_train,
                 window_days=self.rolling_window_days, stability_penalty=self.stability_penalty

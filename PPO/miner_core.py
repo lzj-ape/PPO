@@ -657,9 +657,32 @@ class FactorMinerCore:
                         best_eval['train_factor'],
                         best_eval['val_factor']
                     )
-                    logger.debug(f"✅ Batch best factor committed (reward={best_candidate['reward']:.4f}), pool_size={commit_result.get('pool_size', 0)}")
+                    # 🔥 修复 2: 提升日志级别到 INFO，使其可见
+                    logger.info(f"✅ Batch best factor committed (reward={best_candidate['reward']:.4f}), pool_size={commit_result.get('pool_size', 0)}, incremental_contribution={commit_result.get('incremental_contribution', 0.0):.4f}")
+                    logger.info(f"   Train Score: {commit_result.get('current_train_score', 0.0):.4f}, Val Score: {commit_result.get('current_val_score', 0.0):.4f}")
                 else:
-                    logger.debug(f"❌ Batch best factor not qualified (reward={best_candidate['reward']:.4f}), skipping commit")
+                    # 🔥 显式打印batch级别的拒绝原因
+                    logger.info(f"❌ Batch best factor NOT QUALIFIED:")
+                    logger.info(f"   Best reward in batch: {best_candidate['reward']:.6f}")
+                    logger.info(f"   Incremental sharpe: {best_eval.get('incremental_sharpe', 0.0):.6f}")
+                    logger.info(f"   Current pool size: {len(self.combination_model.alpha_pool)}")
+                    logger.info(f"   Reason: Did not meet acceptance threshold")
+                    # 显示batch中有多少个valid candidates
+                    logger.info(f"   Valid candidates in batch: {len(valid_candidates)}/{batch_size}")
+            else:
+                # 🔥 没有任何合格候选因子
+                logger.info(f"❌ Batch iteration {iteration}: NO valid candidates")
+                logger.info(f"   All {batch_size} expressions failed validation")
+                # 统计失败原因
+                failure_reasons = {}
+                for eval_result in eval_results:
+                    if not eval_result['valid']:
+                        reason = eval_result.get('reason', 'unknown')
+                        failure_reasons[reason] = failure_reasons.get(reason, 0) + 1
+                if failure_reasons:
+                    logger.info(f"   Failure breakdown:")
+                    for reason, count in sorted(failure_reasons.items(), key=lambda x: x[1], reverse=True):
+                        logger.info(f"     {reason}: {count}/{batch_size}")
 
             # 🔥 移除归一化！直接使用原始增量Sharpe作为奖励
             # 原因：增量Sharpe是稀疏但真实的信号，归一化会破坏其意义
