@@ -155,6 +155,23 @@ class ExpressionGenerator:
                 if token == '<SEP>':
                     batch_finished[i] = True
 
+        # 🔥 修复：循环结束后，为所有未完成的表达式强制添加 <SEP>
+        # 同时确保表达式至少有1个有效token（除了<BEG>和<SEP>）
+        for i in range(batch_size):
+            if not batch_finished[i]:
+                # 检查是否有至少1个有效token（除了<BEG>）
+                if len(batch_tokens[i]) < 2:
+                    # 极端情况：只有<BEG>，添加一个默认特征
+                    default_feature = 'close' if 'close' in self.feature_names else self.feature_names[0]
+                    batch_tokens[i].append(default_feature)
+                    batch_states[i].append(self.token_to_id[default_feature])
+                    logger.warning(f"Expression {i} had only <BEG>, added default feature '{default_feature}'")
+
+                # 添加<SEP>
+                batch_tokens[i].append('<SEP>')
+                batch_states[i].append(self.token_to_id['<SEP>'])
+                logger.debug(f"Force-added <SEP> to incomplete expression {i}")
+
         results = []
         for i in range(batch_size):
             results.append((batch_tokens[i], batch_states[i], batch_trajectories[i]))
@@ -169,7 +186,7 @@ class ExpressionGenerator:
         1. 最小长度: 至少 <BEG> feature operator <SEP> (len>=4)
         2. 强制结束: stack==1 且 len>=4 → 必须输出 <SEP>
         3. 禁止早停: stack!=1 → 禁止输出 <SEP>
-        4. 防止溢出: 接近max_len时提前强制结束
+        4. 渐进式约束: 根据剩余空间和当前栈大小动态限制特征添加
         5. 操作符约束: 只有栈足够大时才能使用对应arity的操作符
 
         Returns:
@@ -178,35 +195,43 @@ class ExpressionGenerator:
         current_len = len(state)
         MIN_VALID_LEN = 4  # <BEG> feature op <SEP>
 
-        # 🔥 约束1: 接近最大长度时强制结束
-        # 留3个token的buffer: feature + operator + <SEP>
-        if current_len >= self.max_expr_len - 3:
-            # 如果已经达到最小长度且栈平衡,强制结束
-            stack_size = self._calculate_stack_size(state)
-            if stack_size == 1 and current_len >= MIN_VALID_LEN:
-                return [2], {2: [self.token_to_id['<SEP>']]}
-            # 否则也要强制结束(兜底,避免截断)
-            return [2], {2: [self.token_to_id['<SEP>']]}
-
         stack_size = self._calculate_stack_size(state)
         scale_stack = self._get_scale_stack(state)
+
+        # 🔥 约束1: 当stack==1且达到最小长度时,只能结束
+        if stack_size == 1 and current_len >= MIN_VALID_LEN:
+            return [2], {2: [self.token_to_id['<SEP>']]}
+
+        # 🔥 约束2: 渐进式约束 - 根据剩余空间和栈大小决定是否允许添加特征
+        remaining_space = self.max_expr_len - current_len - 1  # -1 for <SEP>
+        min_ops_needed = max(0, stack_size - 1)  # 需要消耗到stack=1所需的最少操作符数
 
         valid_types = []
         valid_actions_by_type = {}
 
-        # 🔥 约束2: 当stack==1且达到最小长度时,只能结束
-        if stack_size == 1 and current_len >= MIN_VALID_LEN:
-            return [2], {2: [self.token_to_id['<SEP>']]}
-
         # 🔥 约束3: 只有栈有效(stack>=0)时才能添加feature/operator
         if stack_size >= 0:
-            # Type 0: Features - 确保添加后有足够空间完成表达式
-            # 添加feature后最少需要: operator(1) + <SEP>(1) = 2个token
-            if current_len + 2 < self.max_expr_len:
+            # Type 0: Features - 动态限制
+            # 判断是否还有空间添加特征
+            # 添加一个特征后，至少需要 min_ops_needed+1 个操作符才能平衡栈
+            space_needed_if_add_feature = (min_ops_needed + 1) + 1  # 操作符 + <SEP>
+
+            # 🔥 关键改进1: 基于剩余空间的限制
+            can_add_feature_by_space = remaining_space > space_needed_if_add_feature
+
+            # 🔥 关键改进2: 基于栈大小的限制 - 栈太大时禁止继续添加
+            # 使用一个启发式规则: 栈大小不应超过剩余空间的一半
+            # 这样确保有足够的操作符来消耗栈
+            max_reasonable_stack = max(3, remaining_space // 2)
+            can_add_feature_by_stack = stack_size < max_reasonable_stack
+
+            # 两个条件都满足才允许添加特征
+            if can_add_feature_by_space and can_add_feature_by_stack:
                 feature_actions = [self.token_to_id[f] for f in self.feature_names]
                 if feature_actions:
                     valid_types.append(0)
                     valid_actions_by_type[0] = feature_actions
+            # 否则禁止添加特征，必须优先使用操作符消耗栈
 
             # Type 1: Operators - 严格检查栈大小和数量级
             operator_actions = []
@@ -227,14 +252,12 @@ class ExpressionGenerator:
                 valid_types.append(1)
                 valid_actions_by_type[1] = operator_actions
 
-        # Type 2: End - 🔥 约束4: 只有stack==1时才能结束
-        # 注意: 这里不添加,因为上面已经处理了stack==1的情况(强制返回)
-        # 这个分支永远不会执行,但保留作为逻辑完整性
-
-        # 🔥 约束5: 如果没有有效动作,强制结束(兜底,防止死锁)
+        # 🔥 约束4: 如果没有有效动作,强制结束(兜底,防止死锁)
+        # 这种情况可能发生在：栈大小>1但空间不足以消耗到1
         if not valid_types:
-            # 这种情况理论上不应该发生,但作为安全措施
-            logger.warning(f"No valid actions at state len={current_len}, stack={stack_size}, forcing <SEP>")
+            # 无法继续生成有效表达式，只能强制结束
+            logger.warning(f"No valid actions at state len={current_len}, stack={stack_size}, "
+                         f"remaining_space={remaining_space}, forcing <SEP> (will be INVALID)")
             return [2], {2: [self.token_to_id['<SEP>']]}
 
         return valid_types, valid_actions_by_type

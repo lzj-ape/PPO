@@ -309,18 +309,18 @@ class FactorMinerCore:
                 'scale_rule': 'any',
                 'scale_threshold': None
             },
-            'sigmoid': {
-                'arity': 1, 
-                'func': self.ts_ops.sigmoid_op,
-                'scale_rule': 'any',
-                'scale_threshold': None
-            },
-            'tanh': {
-                'arity': 1, 
-                'func': self.ts_ops.tanh_op,
-                'scale_rule': 'any',
-                'scale_threshold': None
-            },
+            # 'sigmoid': {
+            #     'arity': 1, 
+            #     'func': self.ts_ops.sigmoid_op,
+            #     'scale_rule': 'any',
+            #     'scale_threshold': None
+            # },
+            # 'tanh': {
+            #     'arity': 1, 
+            #     'func': self.ts_ops.tanh_op,
+            #     'scale_rule': 'any',
+            #     'scale_threshold': None
+            # },
             
             # ============ 时间序列基础 (8个) ============
             'delay1': {
@@ -616,38 +616,73 @@ class FactorMinerCore:
             eval_results = []
             valid_candidates = []  # 记录合格候选因子
 
+            # 🔥 新增：打印本批次生成的所有因子
+            logger.info(f"\n{'='*80}")
+            logger.info(f"📊 Iteration {iteration}: Batch Evaluation ({batch_size} factors)")
+            logger.info(f"{'='*80}")
+
             for idx, (tokens, state_ids, trajectory) in enumerate(batch_results):
+                # 将tokens转换为可读表达式
+                readable_expr = self.expr_generator.tokens_to_expression(tokens)
+
                 # trial_only=True: 只计算奖励，不添加到池子
                 eval_result = self.factor_evaluator.evaluate_expression(tokens, trial_only=True)
 
                 if eval_result['valid']:
                     final_reward = eval_result['reward']
+                    incremental_sharpe = eval_result.get('incremental_sharpe', 0.0)
+                    qualifies = eval_result.get('qualifies', False)
+
+                    # 🔥 新增：打印每个因子的详细信息
+                    status = "✅ QUALIFIED" if qualifies else "⚠️  VALID"
+                    logger.info(f"\n[Factor {idx+1}/{batch_size}] {status}")
+                    logger.info(f"  Expression: {readable_expr}")
+                    logger.info(f"  Reward: {final_reward:.6f}")
+                    logger.info(f"  Incremental Sharpe: {incremental_sharpe:.6f}")
+                    logger.info(f"  Train Sharpe: {eval_result.get('train_eval', {}).get('sharpe', 0):.4f}")
+                    logger.info(f"  Val Sharpe: {eval_result.get('val_eval', {}).get('sharpe', 0):.4f}")
+
                     # 记录合格候选因子（达到阈值）
-                    if eval_result.get('qualifies', False):
+                    if qualifies:
                         valid_candidates.append({
                             'idx': idx,
                             'tokens': tokens,
                             'reward': final_reward,
-                            'eval_result': eval_result
+                            'eval_result': eval_result,
+                            'readable_expr': readable_expr
                         })
                 else:
                     # 🔥 无效表达式给予小的负奖励，而非-1.0
                     # 这样PPO能学习到"避免无效表达式"但不会被过大的惩罚干扰
                     final_reward = -0.1
-                    # 调试：记录失败原因
-                    if iteration < 3:  # 只在前几次迭代打印
-                        logger.debug(f"Expression invalid: {tokens}, reason: {eval_result.get('reason', 'unknown')}")
+                    reason = eval_result.get('reason', 'unknown')
+
+                    # 🔥 新增：打印无效因子的信息
+                    logger.info(f"\n[Factor {idx+1}/{batch_size}] ❌ INVALID")
+                    logger.info(f"  Expression: {readable_expr}")
+                    logger.info(f"  Reason: {reason}")
+                    logger.info(f"  RPN: {' '.join(tokens[:10])}{'...' if len(tokens) > 10 else ''}")
 
                 raw_rewards.append(final_reward)
                 eval_results.append(eval_result)
 
+            logger.info(f"\n{'='*80}")
+
             # 🔥 阶段2: 选择并提交（Commit）- 只提交本batch中最好的因子
             # 这样避免了同一batch内的因子相互影响奖励
+            logger.info(f"\n{'🎯 Batch Decision':^80}")
+            logger.info(f"{'-'*80}")
+
             if valid_candidates:
                 # 按奖励排序，选择top-1
                 valid_candidates.sort(key=lambda x: x['reward'], reverse=True)
                 best_candidate = valid_candidates[0]
                 best_eval = best_candidate['eval_result']
+
+                logger.info(f"✅ Best Factor in Batch:")
+                logger.info(f"   Expression: {best_candidate['readable_expr']}")
+                logger.info(f"   Reward: {best_candidate['reward']:.6f}")
+                logger.info(f"   Incremental Sharpe: {best_eval.get('incremental_sharpe', 0.0):.6f}")
 
                 # 🔥 检查是否真的qualifies（达到阈值）
                 if best_eval.get('qualifies', False):
@@ -658,17 +693,16 @@ class FactorMinerCore:
                         best_eval['val_factor']
                     )
                     # 🔥 修复 2: 提升日志级别到 INFO，使其可见
-                    logger.info(f"✅ Batch best factor committed (reward={best_candidate['reward']:.4f}), pool_size={commit_result.get('pool_size', 0)}, incremental_contribution={commit_result.get('incremental_contribution', 0.0):.4f}")
-                    logger.info(f"   Train Score: {commit_result.get('current_train_score', 0.0):.4f}, Val Score: {commit_result.get('current_val_score', 0.0):.4f}")
+                    logger.info(f"\n🎉 COMMITTED TO POOL!")
+                    logger.info(f"   Pool size: {commit_result.get('pool_size', 0)}")
+                    logger.info(f"   Train Score: {commit_result.get('current_train_score', 0.0):.4f}")
+                    logger.info(f"   Val Score: {commit_result.get('current_val_score', 0.0):.4f}")
+                    logger.info(f"   Incremental Contribution: {commit_result.get('incremental_contribution', 0.0):.4f}")
                 else:
                     # 🔥 显式打印batch级别的拒绝原因
-                    logger.info(f"❌ Batch best factor NOT QUALIFIED:")
-                    logger.info(f"   Best reward in batch: {best_candidate['reward']:.6f}")
-                    logger.info(f"   Incremental sharpe: {best_eval.get('incremental_sharpe', 0.0):.6f}")
+                    logger.info(f"\n❌ NOT COMMITTED (Did not meet threshold)")
                     logger.info(f"   Current pool size: {len(self.combination_model.alpha_pool)}")
-                    logger.info(f"   Reason: Did not meet acceptance threshold")
-                    # 显示batch中有多少个valid candidates
-                    logger.info(f"   Valid candidates in batch: {len(valid_candidates)}/{batch_size}")
+                    logger.info(f"   Valid candidates: {len(valid_candidates)}/{batch_size}")
             else:
                 # 🔥 没有任何合格候选因子
                 logger.info(f"❌ Batch iteration {iteration}: NO valid candidates")

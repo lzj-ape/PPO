@@ -64,15 +64,15 @@ class TimeSeriesOperators:
         sign = np.sign(x)
         return (sign * np.sqrt(x.abs())).fillna(0)
     
-    @staticmethod
-    def sigmoid_op(x: pd.Series) -> pd.Series:
-        """Sigmoid函数"""
-        return (1 / (1 + np.exp(-np.clip(x, -10, 10)))).fillna(0)
+    # @staticmethod
+    # def sigmoid_op(x: pd.Series) -> pd.Series:
+    #     """Sigmoid函数"""
+    #     return (1 / (1 + np.exp(-np.clip(x, -10, 10)))).fillna(0)
     
-    @staticmethod
-    def tanh_op(x: pd.Series) -> pd.Series:
-        """双曲正切"""
-        return np.tanh(x).fillna(0)
+    # @staticmethod
+    # def tanh_op(x: pd.Series) -> pd.Series:
+    #     """双曲正切"""
+    #     return np.tanh(x).fillna(0)
     
     # ============ 时间序列基础 (13-20) ============
     @staticmethod
@@ -98,9 +98,10 @@ class TimeSeriesOperators:
     @staticmethod
     def ts_rank(x: pd.Series, window: int = 10) -> pd.Series:
         """时序排名"""
-        return x.rolling(window=window, min_periods=1).apply(
+        min_periods = max(window // 2, 3)
+        return x.rolling(window=window, min_periods=min_periods).apply(
             lambda s: pd.Series(s).rank(pct=True).iloc[-1], raw=False
-        ).fillna(0)
+        ).fillna(method='bfill').fillna(0.5)
     
     @staticmethod
     def ts_min(x: pd.Series, window: int = 10) -> pd.Series:
@@ -123,7 +124,8 @@ class TimeSeriesOperators:
     @staticmethod
     def sma(x: pd.Series, window: int = 5) -> pd.Series:
         """简单移动平均"""
-        return x.rolling(window=window, min_periods=1).mean().fillna(0)
+        min_periods = max(window // 2, 2)  # 至少需要一半窗口或2个数据点
+        return x.rolling(window=window, min_periods=min_periods).mean().fillna(method='bfill').fillna(0)
     
     @staticmethod
     def ema(x: pd.Series, span: int = 5) -> pd.Series:
@@ -157,7 +159,8 @@ class TimeSeriesOperators:
     @staticmethod
     def std(x: pd.Series, window: int = 20) -> pd.Series:
         """标准差"""
-        return x.rolling(window=window, min_periods=1).std().fillna(0)
+        min_periods = max(window // 2, 3)  # 标准差至少需要3个点
+        return x.rolling(window=window, min_periods=min_periods).std().fillna(method='bfill').fillna(0)
     
     @staticmethod
     def variance(x: pd.Series, window: int = 20) -> pd.Series:

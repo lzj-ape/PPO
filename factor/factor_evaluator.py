@@ -161,32 +161,47 @@ class FactorEvaluator:
             base_threshold = getattr(self.combination_model.config, 'ic_threshold', 0.01)
             current_pool_size = len(self.combination_model.alpha_pool)
 
-            # 🔥 修复：前期使用0阈值，允许所有有效因子进入
-            if current_pool_size < 3:
-                ic_threshold = 0.0  # 前3个因子：只要增量>0就接受
-            elif current_pool_size < 5:
-                ic_threshold = base_threshold * 0.3  # 第4-5个因子用0.3倍阈值
-            elif current_pool_size < 10:
-                ic_threshold = base_threshold * 0.6  # 第6-10个因子用0.6倍阈值
-            else:
-                ic_threshold = base_threshold  # 之后用正常阈值
+            # 🔥 核心修复：统一使用增量Sharpe作为决策标准和PPO学习信号
+            # 无论池子大小，都使用经过linear优化后的"增量Sharpe"来判断
+            # 原因：
+            # 1. 即使是单因子，combiner也会用Ridge优化权重，得到的是"组合"Sharpe
+            # 2. 增量Sharpe = 新组合Sharpe - 旧组合Sharpe，才是真正的"贡献"
+            # 3. 决策标准和PPO学习目标必须一致，否则策略会混乱
 
-            should_add = incremental_sharpe > ic_threshold and not trial_only
+            # 根据池子大小调整阈值（而非改变评价指标）
+            if current_pool_size < 3:
+                # 前3个因子：允许轻微负值（因为样本少，不确定性大）
+                ic_threshold = -0.03  # 允许-3%的负增量
+            elif current_pool_size < 5:
+                # 第4-5个因子：要求很小的正增量
+                ic_threshold = 0.001  # 0.1%的增量即可
+            elif current_pool_size < 10:
+                # 第6-10个因子：要求中等增量
+                ic_threshold = base_threshold * 0.3  # 0.3%的增量
+            else:
+                # 10个因子后：要求较高增量（池子已经很好了，新因子必须带来明显改进）
+                ic_threshold = base_threshold * 0.6  # 0.6%的增量
+
+            # 统一使用增量Sharpe
+            decision_score = incremental_sharpe
+            ppo_reward_signal = incremental_sharpe
+
+            should_add = decision_score > ic_threshold and not trial_only
             actually_added = False
 
             # 🔥 诊断日志：记录拒绝的原因（显式打印）
-            if not trial_only and incremental_sharpe <= ic_threshold:
+            if not trial_only and decision_score <= ic_threshold:
                 logger.info(f"❌ Factor REJECTED:")
-                logger.info(f"   incremental_sharpe={incremental_sharpe:.6f} <= threshold={ic_threshold:.6f}")
+                logger.info(f"   incremental_sharpe={decision_score:.6f} <= threshold={ic_threshold:.6f}")
                 logger.info(f"   base_threshold={base_threshold:.6f}, pool_size={current_pool_size}")
                 logger.info(f"   base_train_score={self.combination_model.base_train_score:.4f}")
                 logger.info(f"   new_train_score={trial_result['train_stats']['sharpe']:.4f}")
                 logger.info(f"   expression: {' '.join(tokens[:15])}...")
 
-                # 🔥 额外诊断：分析为什么增量低
-                if incremental_sharpe <= 0:
+                # 🔥 额外诊断：分析为什么被拒绝
+                if decision_score <= 0:
                     logger.info(f"   ⚠️  Reason: New factor does NOT improve the combination (negative/zero increment)")
-                elif self.combination_model.base_train_score > 2.0 and incremental_sharpe < 0.01:
+                elif self.combination_model.base_train_score > 2.0 and decision_score < 0.01:
                     logger.info(f"   ⚠️  Reason: Base score is already high, hard to improve further")
                 else:
                     logger.info(f"   ⚠️  Reason: Improvement too small (below threshold)")
@@ -206,7 +221,7 @@ class FactorEvaluator:
 
                 # 🔥 记录成功添加（详细信息）
                 logger.info(f"✅ Factor ACCEPTED:")
-                logger.info(f"   incremental_sharpe={incremental_sharpe:.6f} > threshold={ic_threshold:.6f}")
+                logger.info(f"   incremental_sharpe={decision_score:.6f} > threshold={ic_threshold:.6f}")
                 logger.info(f"   Pool size: {old_pool_size} → {current_pool_size}")
                 logger.info(f"   Train score: {old_train_score:.4f} → {train_score_after:.4f} (Δ={train_score_after - old_train_score:.4f})")
                 logger.info(f"   Val score: {commit_result.get('current_val_score', 0.0):.4f}")
@@ -222,7 +237,8 @@ class FactorEvaluator:
                 val_score_after = val_stats.get('sharpe', 0.0)
 
             # 5. 🔥 应用高级奖励计算（惩罚项 + 多样性惩罚）
-            final_reward = incremental_sharpe + diversity_penalty
+            # 使用 ppo_reward_signal 而非 incremental_sharpe，确保PPO学习到正确的信号
+            final_reward = ppo_reward_signal + diversity_penalty
             penalty_components = {'diversity_penalty': diversity_penalty}
 
             if self.reward_calculator is not None:
@@ -251,36 +267,37 @@ class FactorEvaluator:
                 # 更新penalty_components
                 penalty_components.update(penalty_components_extra)
 
-                # 最终奖励 = 增量Sharpe + 多样性惩罚 + 其他惩罚项
-                final_reward = incremental_sharpe + diversity_penalty + complexity_penalty + overfitting_penalty
+                # 最终奖励 = PPO奖励信号 + 多样性惩罚 + 其他惩罚项
+                final_reward = ppo_reward_signal + diversity_penalty + complexity_penalty + overfitting_penalty
 
-                # logger.debug(f"Reward breakdown: incremental={incremental_sharpe:.4f}, "
+                # logger.debug(f"Reward breakdown: ppo_signal={ppo_reward_signal:.4f}, "
                 #            f"diversity={diversity_penalty:.4f}, complexity={complexity_penalty:.4f}, "
                 #            f"overfitting={overfitting_penalty:.4f}, final={final_reward:.4f}")
 
-            # 6. 返回结果（奖励是增量Sharpe + 惩罚）
+            # 6. 返回结果（奖励是PPO reward signal + 惩罚）
             return {
                 'valid': True,
-                'reward': final_reward,  # 🔥 核心修复：增量 + 多样性 + 惩罚
+                'reward': final_reward,  # 🔥 PPO学习信号（真实的增量Sharpe + 惩罚）
                 'pool_size': current_pool_size,
                 'added_to_pool': actually_added,  # 是否真的被添加（trial_only时为False）
-                'qualifies': incremental_sharpe > ic_threshold,  # 是否达标
-                'incremental_sharpe': incremental_sharpe,
+                'qualifies': decision_score > ic_threshold,  # 🔥 修复：使用decision_score判断
+                'incremental_sharpe': incremental_sharpe,  # 保持原始增量Sharpe供记录
+                'ppo_reward_signal': ppo_reward_signal,  # 🔥 新增：显式返回PPO学习的信号
                 'penalty_components': penalty_components,
-                'train_factor': train_factor,  # 🔥 新增：返回因子数据供后续提交
+                'train_factor': train_factor,
                 'val_factor': val_factor,
                 'alpha_info': alpha_info,
                 'train_eval': {
                     'sharpe': train_score_after,
-                    'ic': incremental_sharpe * 0.5,  # IC和增量Sharpe相关
-                    'composite_score': incremental_sharpe
+                    'ic': ppo_reward_signal * 0.5,  # 🔥 使用ppo_reward_signal
+                    'composite_score': ppo_reward_signal
                 },
                 'val_eval': {
                     'sharpe': val_score_after,
-                    'ic': incremental_sharpe * 0.5,
+                    'ic': ppo_reward_signal * 0.5,
                     'composite_score': val_stats.get('composite_score', 0.0)
                 },
-                'composite_score': final_reward  # 🔥 这里也改为最终奖励
+                'composite_score': final_reward
             }
 
         except Exception as e:
@@ -392,14 +409,22 @@ class FactorEvaluator:
                     except Exception:
                         return None # 算子执行失败（如除零）
 
-                    # 🔥 中间结果清洗：
-                    # 为了保持计算链的稳定性，中间步骤也进行轻量级清洗
-                    # 但完全的分布对齐只在最后一步进行
+                    # 🔥 中间结果清洗：更保守的策略，避免过度填充传播错误
                     result = result.replace([np.inf, -np.inf], np.nan)
-                    
-                    # 简单的 fillna 防止 NaN 传染，这里用 ffill 保持因果性
-                    result = result.ffill().fillna(0)
-                    
+
+                    # 🔥 修复：放宽NaN容忍度 0.5 → 0.7
+                    # 原因：train_computation_failed 11/16，NaN检查过于严格导致计算失败
+                    # 检查NaN比例，如果过高则认为计算失败
+                    if len(result) > 0:
+                        nan_ratio = result.isna().sum() / len(result)
+                        if nan_ratio > 0.7:  # 从0.5提高到0.7
+                            # NaN比例超过70%，中间步骤失败
+                            return None
+
+                    # 只在NaN比例不高时才填充
+                    if result.isna().any():
+                        result = result.ffill().fillna(0)
+
                     stack.append(result)
 
                 else:
@@ -433,66 +458,65 @@ class FactorEvaluator:
 
     def _clean_series(self, series: pd.Series, is_training: bool) -> Optional[pd.Series]:
         """
-        清理序列 - 严格防止未来函数 (Strict No-Lookahead)
-        
-        Args:
-            series: 输入序列
-            is_training: True=计算并保存统计量; False=使用已保存的统计量
+        清理序列：去极值 + 标准化 (Z-Score)
         """
         if series is None:
             return None
 
-        # 1. 替换无穷值
+        # 1. 基础清洗
         series = series.replace([np.inf, -np.inf], np.nan)
-
-        # 2. 检查 NaN 比例 (如果太多缺失，直接丢弃)
-        # 注意：在 Valid 集中，如果由于 Lookback Buffer 不足导致开头有 NaN，
-        # 这里的阈值需要宽容一些，或者在外部保证 Buffer 足够。
-        nan_ratio = series.isna().sum() / len(series)
-        if nan_ratio > 0.5:
+        # 🔥 修复：放宽NaN容忍度 0.5 → 0.7
+        # 原因：train_computation_failed 11/16，NaN检查过于严格
+        # 检查 NaN 比例
+        if series.isna().sum() / len(series) > 0.7:  # 从0.5提高到0.7
             return None
-
-        # 3. 因果填充 (Causal Imputation)
-        # 优先使用前向填充 (ffill)，这意味着用“昨天”的值填补“今天”的空缺
-        # 严禁使用 series.median() 直接填充，因为那是未来的统计量
         series = series.ffill()
 
-        # 4. 去极值和剩余缺失值填充 (Clip & Fill)
+        # 2. 计算/应用统计量
         if is_training:
-            # === 训练模式：学习统计量 ===
             try:
-                median_val = series.median()
-                # 使用 1% 和 99% 分位数确定边界
-                q01 = series.quantile(0.01)
-                q99 = series.quantile(0.99)
+                # 计算统计量
+                median = series.median()
+                # 这里的 quantile 范围可以适当放宽，比如 0.005 和 0.995
+                lower = series.quantile(0.01)
+                upper = series.quantile(0.99)
+                
+                # 先去极值，再算均值方差，这样更稳健
+                clipped = series.clip(lower, upper)
+                mean = clipped.mean()
+                std = clipped.std()
                 
                 # 缓存统计量
                 self.current_factor_stats = {
-                    'median': float(median_val) if not pd.isna(median_val) else 0.0,
-                    'lower': float(q01) if not pd.isna(q01) else -10.0,
-                    'upper': float(q99) if not pd.isna(q99) else 10.0
+                    'median': float(median) if not pd.isna(median) else 0.0,
+                    'lower': float(lower) if not pd.isna(lower) else -3.0,
+                    'upper': float(upper) if not pd.isna(upper) else 3.0,
+                    'mean': float(mean) if not pd.isna(mean) else 0.0,
+                    'std': float(std) if not pd.isna(std) else 1.0,
                 }
-            except Exception:
-                return None # 统计量计算失败
-                
-            # 应用截断
-            series = series.clip(self.current_factor_stats['lower'], self.current_factor_stats['upper'])
-            # 填充剩余的 NaN (通常是序列开头的)
-            series = series.fillna(self.current_factor_stats['median'])
-
-        else:
-            # === 验证/实盘模式：应用统计量 ===
-            if self.current_factor_stats is None:
-                # 这是一个异常情况：试图在没有训练统计量的情况下评估验证集
-                # 回退策略：被迫使用当前数据的统计量（会有轻微未来函数，但总比崩溃好）
-                # 更好的做法是返回 None 或报错
-                logger.warning("Evaluating validation data without training stats! Fallback to local stats.")
+            except:
+                return None
+        
+        # 检查是否有统计量可用
+        if self.current_factor_stats is None:
+            if not is_training:
+                # 验证集没有统计量时的回退策略
                 return self._clean_series(series, is_training=True)
-            
-            # 严格使用训练集的边界进行截断
-            series = series.clip(self.current_factor_stats['lower'], self.current_factor_stats['upper'])
-            
-            # 严格使用训练集的中位数填充剩余 NaN
-            series = series.fillna(self.current_factor_stats['median'])
+            return None
 
+        stats = self.current_factor_stats
+
+        # 3. 执行清洗操作
+        # A. 去极值 (Winsorization)
+        series = series.clip(stats['lower'], stats['upper'])
+        
+        # B. 填充缺失值 (使用中位数)
+        series = series.fillna(stats['median'])
+        
+        # C. 🔥 标准化 (Z-Score) - 这是你之前缺少的关键一步！
+        if stats['std'] > 1e-8:
+            series = (series - stats['mean']) / stats['std']
+        else:
+            series = series - stats['mean']
+            
         return series

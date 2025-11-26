@@ -16,6 +16,7 @@ from factor.evaluator import ICDiversityEvaluator
 from PPO.networks import ActorCriticNetwork, LSTMFeatureExtractor, LSTMFactorCombiner
 from PPO.buffer import PPOBuffer
 from factor.combiner import ImprovedCombinationModel
+from factor.signals import SignalGenerator, PerformanceEvaluator
 from PPO.miner_new import OptimizedSynergisticFactorMiner
 from backtest.backtest import Backtester, MinerBacktester
 from utils.utils import setup_logging, get_device
@@ -23,6 +24,8 @@ from utils.utils import setup_logging, get_device
 __all__ = [
     'TrainingConfig',
     'TimeSeriesOperators',
+    'SignalGenerator',
+    'PerformanceEvaluator',
     'ICDiversityEvaluator',
     'ActorCriticNetwork',
     'LSTMFeatureExtractor',

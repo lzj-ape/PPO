@@ -92,7 +92,9 @@ class ImprovedCombinationModel:
         # 3. 🔥 创建临时模型（不污染 self.ridge_model）
         X_train, y_train = self._align_and_clean(temp_train_X, self.train_target)
 
-        if len(X_train) < 100:
+        # 🔥 修复：降低最小数据要求 100 → 50
+        # 原因：train_computation_failed 11/16，数据量要求太高导致计算失败
+        if len(X_train) < 50:
             return {'train_incremental_sharpe': 0.0, 'train_stats': {'sharpe': 0.0}, 'val_stats': {'sharpe': 0.0}}
 
         try:
@@ -134,6 +136,15 @@ class ImprovedCombinationModel:
                 train_pred_series, y_train,
                 window_days=self.rolling_window_days, stability_penalty=self.stability_penalty
             )
+
+            # 🔥 修复：如果计算失败（返回None），直接返回失败结果
+            if new_train_score is None:
+                logger.debug("Combiner trial: calculate_rolling_sharpe_stability returned None (computation failed)")
+                return {
+                    'train_incremental_sharpe': 0.0,
+                    'train_stats': {'sharpe': 0.0, 'composite_score': 0.0},
+                    'val_stats': {'sharpe': 0.0, 'composite_score': 0.0},
+                }
 
             # 4. 计算增量 (Reward)
             incremental_score = new_train_score - self.base_train_score
@@ -214,10 +225,17 @@ class ImprovedCombinationModel:
             train_pred_vals = self.ridge_model.predict(X_train_scaled)
             train_pred_series = pd.Series(train_pred_vals, index=X_train.index)
 
-            self.base_train_score = self.evaluator.calculate_rolling_sharpe_stability(
+            new_base_score = self.evaluator.calculate_rolling_sharpe_stability(
                 train_pred_series, y_train,
                 window_days=self.rolling_window_days, stability_penalty=self.stability_penalty
             )
+
+            # 🔥 修复：如果计算失败，使用0作为基准分数
+            if new_base_score is None:
+                logger.warning("add_alpha_and_optimize: train score calculation failed, using 0.0")
+                self.base_train_score = 0.0
+            else:
+                self.base_train_score = new_base_score
 
             # Val Score Update (如果需要)
             if self.val_matrix is not None and self.val_target is not None:
@@ -236,10 +254,17 @@ class ImprovedCombinationModel:
                         X_val_scaled = X_val.values
 
                     val_pred = self.ridge_model.predict(X_val_scaled)
-                    self.base_val_score = self.evaluator.calculate_rolling_sharpe_stability(
+                    new_val_score = self.evaluator.calculate_rolling_sharpe_stability(
                         pd.Series(val_pred, index=X_val.index), y_val,
                         window_days=self.rolling_window_days, stability_penalty=self.stability_penalty
                     )
+
+                    # 🔥 修复：如果计算失败，使用0
+                    if new_val_score is None:
+                        logger.warning("add_alpha_and_optimize: val score calculation failed, using 0.0")
+                        self.base_val_score = 0.0
+                    else:
+                        self.base_val_score = new_val_score
 
         # 🔥 记录该因子的增量贡献
         incremental_contribution = self.base_train_score - score_before_add
@@ -316,10 +341,17 @@ class ImprovedCombinationModel:
 
             # 更新 Base Score
             train_pred = self.ridge_model.predict(X_train_scaled)
-            self.base_train_score = self.evaluator.calculate_rolling_sharpe_stability(
+            new_score = self.evaluator.calculate_rolling_sharpe_stability(
                 pd.Series(train_pred, index=X_train.index), y_train,
                 window_days=self.rolling_window_days, stability_penalty=self.stability_penalty
             )
+
+            # 🔥 修复：如果计算失败，使用0
+            if new_score is None:
+                logger.warning("_prune_factor: score calculation failed, using 0.0")
+                self.base_train_score = 0.0
+            else:
+                self.base_train_score = new_score
 
             logger.info(f"After pruning: pool_size={len(self.alpha_pool)}, base_score={self.base_train_score:.4f}")
 

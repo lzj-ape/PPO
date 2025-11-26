@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python test_improvements.py:*)"
+      "Bash(python test_improvements.py:*)",
+      "Bash(python test_expression_generator.py:*)",
+      "Bash(python test_threshold_fix.py:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(pip uninstall:*)"
     ],
     "deny": [],
     "ask": []

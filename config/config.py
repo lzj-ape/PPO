@@ -47,9 +47,15 @@ class TrainingConfig:
     
     # 因子筛选阈值
     # 🔥 增量Sharpe阈值：只有带来实质性改进的因子才被接受
-    # 降低阈值以允许更多因子进入池子，特别是在初期
-    # 使用自适应策略：当池子很小时用更低的阈值，池子大时再提高
-    ic_threshold: float = 0.01  # 增量Sharpe阈值（降低到0.01以增加因子多样性）
+    #
+    # 新策略（2025-01）：
+    # - 使用自适应阈值：前期低阈值快速积累因子，后期高阈值精选因子
+    # - 统一使用增量Sharpe（经过linear优化后的组合改进）作为评价标准
+    # - 前3个因子：ic_threshold = -0.03（允许轻微负值）
+    # - 第4-5个：ic_threshold = 0.001（0.1%增量）
+    # - 第6-10个：ic_threshold = base * 0.3（0.3%增量）
+    # - 10个以上：ic_threshold = base * 0.6（0.6%增量）
+    ic_threshold: float = 0.01  # 基础阈值（用于后期）
 
     # 🔥 高级Reward配置（新增）
     reward_type: str = 'hybrid'  # 'incremental', 'penalized', 'stable', 'hybrid', 'full'
